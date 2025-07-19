@@ -1,0 +1,19 @@
+# 2048 Game Implementation Requirements
+# This implementation uses only Python standard library modules
+# No external dependencies are required
+
+# Python 3.7+ recommended for full feature support
+# The game uses:
+# - random (for tile generation)
+# - copy (for game state copying)
+# - typing (for type hints)
+# - enum (for Direction and GameState enums)
+# - os, sys (for terminal/display functionality)
+# - time (for demo delays)
+
+# All modules are part of the Python standard library
+# No pip installation needed!
+
+# For development or testing, you might want:
+# pytest>=6.0.0
+# mypy>=0.910 
