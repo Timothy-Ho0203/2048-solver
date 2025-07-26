@@ -14,6 +14,10 @@
 # All modules are part of the Python standard library
 # No pip installation needed!
 
+# For Actor-Critic neural network implementation (actor_critic.py):
+torch>=1.9.0
+numpy>=1.21.0
+
 # For development or testing, you might want:
 # pytest>=6.0.0
 # mypy>=0.910 
