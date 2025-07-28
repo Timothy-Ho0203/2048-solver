@@ -265,6 +265,10 @@ class ExperienceReplay:
         """Sample a batch of experiences."""
         return random.sample(self.buffer, min(batch_size, len(self.buffer)))
     
+    def clear(self):
+        """Clear the experience buffer."""
+        self.buffer = deque(maxlen=self.capacity)
+    
     def __len__(self) -> int:
         """Return the current size of the buffer."""
         return len(self.buffer)
@@ -306,6 +310,10 @@ class ActorCriticTrainer:
     def collect_experience(self, experience: Experience):
         """Collect an experience for training."""
         self.experience_buffer.push(experience)
+
+    def clear_experience(self):
+        """Clear the experience buffer."""
+        self.experience_buffer.clear()
     
     def train_step(self, batch_size: int = 32) -> Tuple[float, float]:
         """
@@ -334,9 +342,9 @@ class ActorCriticTrainer:
         critic_loss = self._train_critic(states, rewards, next_states, dones)
         
         # Train Actor
-        actor_loss = self._train_actor(states, actions, rewards, next_states, dones)
+        actor_loss, entropy = self._train_actor(states, actions, rewards, next_states, dones)
         
-        return actor_loss, critic_loss
+        return actor_loss, critic_loss, entropy
     
     def _train_critic(self, states: torch.Tensor, rewards: torch.Tensor,
                      next_states: torch.Tensor, dones: torch.Tensor) -> float:
@@ -363,14 +371,11 @@ class ActorCriticTrainer:
     
     def _train_actor(self, states: torch.Tensor, actions: torch.Tensor,
                     rewards: torch.Tensor, next_states: torch.Tensor, 
-                    dones: torch.Tensor) -> float:
+                    dones: torch.Tensor, beta: float = 0.01) -> float:
         """Train the actor network using policy gradient."""
-        # Get action logits
+        # Get action logits and distribution
         logits = self.actor(states)
-        action_probs = F.softmax(logits, dim=1)
-        
-        # Get selected action probabilities
-        selected_probs = action_probs.gather(1, actions.unsqueeze(1)).squeeze()
+        dist = torch.distributions.Categorical(logits=logits)
         
         # Compute advantages (TD error)
         with torch.no_grad():
@@ -378,19 +383,24 @@ class ActorCriticTrainer:
             next_values = self.critic(next_states).squeeze()
             targets = rewards + self.gamma * next_values * (~dones)
             advantages = targets - current_values
+            advantages = advantages.detach()
         
         # Policy gradient loss
-        log_probs = torch.log(selected_probs + 1e-8)  # Add epsilon for numerical stability
-        actor_loss = -(log_probs * advantages).mean()
+        log_probs = dist.log_prob(actions)
+        pg_loss = -(log_probs * advantages).mean()
+        entropy = dist.entropy().mean()
+        actor_loss = pg_loss - beta * entropy
         
         # Update actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
         
         loss_value = actor_loss.item()
         self.actor_losses.append(loss_value)
-        return loss_value
+        entropy_value = entropy.item()
+        return loss_value, entropy_value
     
     def _direction_to_idx(self, direction: Direction) -> int:
         """Convert Direction to index."""
@@ -553,19 +563,23 @@ class GameDataCollector:
         return new_game
 
 
-def create_actor_critic_models(hidden_size: int = 512) -> Tuple[ActorNetwork, CriticNetwork, ActorCriticTrainer]:
+def create_actor_critic_models(hidden_size: int = 512, 
+                              actor_lr: float = 1e-4, 
+                              critic_lr: float = 1e-4) -> Tuple[ActorNetwork, CriticNetwork, ActorCriticTrainer]:
     """
     Factory function to create Actor-Critic models and trainer.
     
     Args:
         hidden_size: Size of hidden layers
+        actor_lr: Learning rate for actor network
+        critic_lr: Learning rate for critic network
         
     Returns:
         Tuple[ActorNetwork, CriticNetwork, ActorCriticTrainer]: Created models and trainer
     """
     actor = ActorNetwork(hidden_size=hidden_size // 2)
     critic = CriticNetwork(hidden_size=hidden_size)
-    trainer = ActorCriticTrainer(actor, critic)
+    trainer = ActorCriticTrainer(actor, critic, actor_lr=actor_lr, critic_lr=critic_lr)
     
     return actor, critic, trainer
 
