@@ -13,8 +13,9 @@ from display import Display2048, print_game
 # Actor-Critic integration
 from actor_critic import (
     create_actor_critic_models, ExpectimaxIntegrator, 
-    ActorCriticTrainer, GameDataCollector, save_models, load_models, Experience
+    ActorCriticTrainer, GameDataCollector, save_models, load_models
 )
+from experience_replay import Experience
 from config import Config
 
 
@@ -618,19 +619,16 @@ class EnhancedExpectimaxAgent:
 
             success = self.game.move(move)
             
+            # Collect experience for both successful and failed moves
+            if data_collector:
+                new_max_tile = self.game.get_max_tile()
+                new_state = [row[:] for row in self.game.get_board()]
+                new_score = self.game.get_score()
+                done = self.game.get_game_state() != GameState.ONGOING
+                data_collector.collect_experience(current_state, new_state, current_score, new_score, current_max_tile, new_max_tile, success, done, move)
+                experiences_collected += 1
+            
             if success:
-                # Collect experience from the actual move
-                if data_collector:
-                    new_max_tile = self.game.get_max_tile()
-                    new_state = [row[:] for row in self.game.get_board()]
-                    new_score = self.game.get_score()
-                    reward = self._compute_shaped_reward(current_state, new_state, current_score, new_score, current_max_tile, new_max_tile, success, self.game.get_game_state() != GameState.ONGOING)
-                    done = self.game.get_game_state() != GameState.ONGOING
-                    
-                    experience = Experience(current_state, move, reward, new_state, done)
-                    data_collector.trainer.collect_experience(experience)
-                    experiences_collected += 1
-                
                 moves_made += 1
                 move_sequence.append(move)
                 
@@ -702,6 +700,11 @@ def train_actor_critic_agent(num_episodes: int = 100, display_games: bool = Fals
         'actor_entropies': []
     }
     
+    # Performance tracking for early stopping
+    best_avg_score = 0
+    patience_counter = 0
+    patience_limit = 50  # Episodes without improvement before adjusting
+    
     for episode in range(num_episodes):
         # Create a fresh game for this episode
         game = Game2048()
@@ -740,22 +743,43 @@ def train_actor_critic_agent(num_episodes: int = 100, display_games: bool = Fals
                 training_stats['critic_losses'].append(sum(episode_critic_losses) / len(episode_critic_losses))
                 training_stats['actor_entropies'].append(sum(episode_actor_entropies) / len(episode_actor_entropies))
         
+        # Performance monitoring and adaptation
+        if episode % 10 == 0 and episode > 20:
+            recent_scores = episode_scores[-10:] if len(episode_scores) >= 10 else episode_scores
+            avg_score = sum(recent_scores) / len(recent_scores)
+            
+            # Check for performance improvement
+            if avg_score > best_avg_score * 1.05:  # 5% improvement threshold
+                best_avg_score = avg_score
+                patience_counter = 0
+            else:
+                patience_counter += 10  # Increment by checking interval
+                
+                # If no improvement for too long, boost exploration
+                if patience_counter >= patience_limit:
+                    trainer.current_entropy_coeff = min(0.05, trainer.current_entropy_coeff * 2.0)
+                    print(f"🔄 Performance plateau detected! Boosting exploration to {trainer.current_entropy_coeff:.4f}")
+                    patience_counter = 0
+        
         # Print progress
         if episode % 10 == 0 or episode == num_episodes - 1:
             recent_scores = episode_scores[-10:] if len(episode_scores) >= 10 else episode_scores
             avg_score = sum(recent_scores) / len(recent_scores)
-            buffer_size = len(trainer.experience_buffer)
+            
+            # Get diagnostic info
+            training_info = trainer.get_training_info()
             
             loss_info = ""
             if training_stats['actor_losses'] and training_stats['critic_losses']:
-                loss_info = (f", Actor Loss: {training_stats['actor_losses'][-1]:.4f}, "
-                           f"Critic Loss: {training_stats['critic_losses'][-1]:.4f}, "
-                           f"Actor Entropy: {training_stats['actor_entropies'][-1]:.4f}")
+                loss_info = (f", A_Loss: {training_stats['actor_losses'][-1]:.4f}, "
+                           f"C_Loss: {training_stats['critic_losses'][-1]:.4f}, "
+                           f"Entropy: {training_stats['actor_entropies'][-1]:.4f}, "
+                           f"Ent_Coeff: {training_info['current_entropy_coeff']:.4f}")
             
             print(f"Episode {episode + 1:4d}: Score {result['final_score']:6d}, "
                   f"Max Tile {result['max_tile']:4d}, "
-                  f"Avg Score (last 10): {avg_score:.1f},"
-                  f"Buffer: {buffer_size}{loss_info}")
+                  f"Avg Score (last 10): {avg_score:.1f}, "
+                  f"Buffer: {training_info['buffer_size']}{loss_info}")
     
     # Training completed
     print("\n" + "=" * 60)

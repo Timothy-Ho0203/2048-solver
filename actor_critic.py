@@ -14,10 +14,9 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
-import random
 from typing import List, Tuple, Optional, Dict
-from collections import deque
 from game import Game2048, Direction, GameState
+from experience_replay import PrioritizedReplayBuffer, Experience
 
 
 class BoardEncoder:
@@ -68,7 +67,6 @@ class BoardEncoder:
                     flat_board.append(np.log2(board[i][j]) / 16.0)
         
         return torch.FloatTensor(flat_board)
-
 
 class CriticNetwork(nn.Module):
     """
@@ -132,7 +130,6 @@ class CriticNetwork(nn.Module):
             state = BoardEncoder.encode_board_flat(board)
             value = self.forward(state)
             return value.item()
-
 
 class ActorNetwork(nn.Module):
     """
@@ -231,49 +228,6 @@ class ActorNetwork(nn.Module):
             
             return valid_probs
 
-
-class Experience:
-    """Container for a single experience tuple."""
-    
-    def __init__(self, state: List[List[int]], action: Direction, 
-                 reward: float, next_state: List[List[int]], done: bool):
-        self.state = state
-        self.action = action
-        self.reward = reward
-        self.next_state = next_state
-        self.done = done
-
-
-class ExperienceReplay:
-    """Experience replay buffer for training."""
-    
-    def __init__(self, capacity: int = 10000):
-        """
-        Initialize experience replay buffer.
-        
-        Args:
-            capacity: Maximum number of experiences to store
-        """
-        self.buffer = deque(maxlen=capacity)
-        self.capacity = capacity
-    
-    def push(self, experience: Experience):
-        """Add an experience to the buffer."""
-        self.buffer.append(experience)
-    
-    def sample(self, batch_size: int) -> List[Experience]:
-        """Sample a batch of experiences."""
-        return random.sample(self.buffer, min(batch_size, len(self.buffer)))
-    
-    def clear(self):
-        """Clear the experience buffer."""
-        self.buffer = deque(maxlen=self.capacity)
-    
-    def __len__(self) -> int:
-        """Return the current size of the buffer."""
-        return len(self.buffer)
-
-
 class ActorCriticTrainer:
     """
     Trainer for Actor-Critic networks using game experience.
@@ -296,16 +250,32 @@ class ActorCriticTrainer:
         self.critic = critic
         self.gamma = gamma
         
-        # Optimizers
+        # Optimizers with scheduling
         self.actor_optimizer = optim.Adam(actor.parameters(), lr=actor_lr)
         self.critic_optimizer = optim.Adam(critic.parameters(), lr=critic_lr)
         
-        # Experience replay
-        self.experience_buffer = ExperienceReplay()
+        # Learning rate schedulers
+        self.actor_scheduler = optim.lr_scheduler.ExponentialLR(self.actor_optimizer, gamma=0.9995)
+        self.critic_scheduler = optim.lr_scheduler.ExponentialLR(self.critic_optimizer, gamma=0.9995)
+        
+        # Prioritized Experience Replay buffer with better settings
+        self.experience_buffer = PrioritizedReplayBuffer(
+            capacity=100_000,
+            alpha=0.5,  # Less aggressive prioritization 
+            beta=0.4,   # Initial importance sampling correction
+            beta_increment_per_sampling=5e-5  # Slower beta growth
+        )
+        
+        # Entropy scheduling for exploration
+        self.initial_entropy_coeff = 0.1  # Higher initial value
+        self.min_entropy_coeff = 0.001    # Minimum to maintain some exploration
+        self.entropy_decay = 0.9999       # Very slow decay
+        self.current_entropy_coeff = self.initial_entropy_coeff
         
         # Training statistics
         self.actor_losses = []
         self.critic_losses = []
+        self.training_steps = 0
     
     def collect_experience(self, experience: Experience):
         """Collect an experience for training."""
@@ -315,21 +285,32 @@ class ActorCriticTrainer:
         """Clear the experience buffer."""
         self.experience_buffer.clear()
     
-    def train_step(self, batch_size: int = 32) -> Tuple[float, float]:
+    def get_training_info(self) -> Dict:
+        """Get current training diagnostics."""
+        return {
+            'training_steps': self.training_steps,
+            'current_entropy_coeff': self.current_entropy_coeff,
+            'actor_lr': self.actor_optimizer.param_groups[0]['lr'],
+            'critic_lr': self.critic_optimizer.param_groups[0]['lr'],
+            'buffer_size': len(self.experience_buffer)
+        }
+    
+    def train_step(self, batch_size: int = 32) -> Tuple[float, float, float]:
         """
-        Perform one training step.
+        Perform one training step using prioritized experience replay.
         
         Args:
             batch_size: Size of training batch
             
         Returns:
-            Tuple[float, float]: Actor loss, Critic loss
+            Tuple[float, float, float]: Actor loss, Critic loss, Actor entropy
         """
         if len(self.experience_buffer) < batch_size:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
         
-        # Sample batch
-        batch = self.experience_buffer.sample(batch_size)
+        # Sample batch from prioritized buffer
+        batch, indices, is_weights = self.experience_buffer.sample(batch_size)
+        is_weights = torch.FloatTensor(is_weights)
         
         # Prepare batch data
         states = torch.stack([BoardEncoder.encode_board_flat(exp.state) for exp in batch])
@@ -338,17 +319,62 @@ class ActorCriticTrainer:
         next_states = torch.stack([BoardEncoder.encode_board_flat(exp.next_state) for exp in batch])
         dones = torch.BoolTensor([exp.done for exp in batch])
         
-        # Train Critic
-        critic_loss = self._train_critic(states, rewards, next_states, dones)
+        # Train Critic and get TD errors for priority updates
+        critic_loss, td_errors = self._train_critic(states, rewards, next_states, dones, is_weights)
+        
+        # Update priorities based on TD errors
+        self.experience_buffer.update_priorities(indices, td_errors.detach().cpu().numpy())
         
         # Train Actor
-        actor_loss, entropy = self._train_actor(states, actions, rewards, next_states, dones)
+        actor_loss, entropy = self._train_actor(states, actions, rewards, next_states, dones, is_weights)
+        
+        # Update training step counter
+        self.training_steps += 1
+        
+        # Step critic scheduler occasionally
+        if self.training_steps % 100 == 0:
+            self.critic_scheduler.step()
         
         return actor_loss, critic_loss, entropy
     
+    def compute_shaped_reward(
+        self,
+        prev_board,
+        new_board,
+        prev_score,
+        new_score,
+        prev_max_tile,
+        new_max_tile,
+        success,
+        game_done
+    ):
+        # Core score difference
+        reward = (new_score - prev_score) / 100.0  # scale down
+
+        # Count empty tiles
+        prev_empty = sum(row.count(0) for row in prev_board)
+        new_empty = sum(row.count(0) for row in new_board)
+        empty_diff = new_empty - prev_empty
+        reward += 0.1 * empty_diff  # encourages board space
+
+        # Max tile increase
+        if new_max_tile > prev_max_tile:
+            reward += (new_max_tile - prev_max_tile) / 10.0  # milestone bonus
+
+        # Penalize failed move
+        if not success:
+            reward -= 1.0
+
+        # Game over penalty
+        if game_done:
+            reward -= 10.0
+
+        return reward
+    
     def _train_critic(self, states: torch.Tensor, rewards: torch.Tensor,
-                     next_states: torch.Tensor, dones: torch.Tensor) -> float:
-        """Train the critic network using TD error."""
+                     next_states: torch.Tensor, dones: torch.Tensor, 
+                     is_weights: torch.Tensor) -> Tuple[float, torch.Tensor]:
+        """Train the critic network using TD error with importance sampling."""
         # Current state values
         current_values = self.critic(states).squeeze()
         
@@ -356,46 +382,71 @@ class ActorCriticTrainer:
         with torch.no_grad():
             next_values = self.critic(next_states).squeeze()
             targets = rewards + self.gamma * next_values * (~dones)
+            
+            # Clip targets to reasonable range to prevent exploding values
+            targets = torch.clamp(targets, -100, 100)
         
-        # Compute loss (MSE)
-        critic_loss = F.mse_loss(current_values, targets)
+        # Compute TD errors
+        td_errors = targets - current_values
+        
+        # Compute weighted loss using importance sampling weights
+        critic_loss = (is_weights * td_errors.pow(2)).mean()
         
         # Update critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)  # Add gradient clipping
         self.critic_optimizer.step()
         
         loss_value = critic_loss.item()
         self.critic_losses.append(loss_value)
-        return loss_value
+        
+        # Return loss and TD errors (for priority updates)
+        return loss_value, td_errors.abs()
     
     def _train_actor(self, states: torch.Tensor, actions: torch.Tensor,
                     rewards: torch.Tensor, next_states: torch.Tensor, 
-                    dones: torch.Tensor, beta: float = 0.01) -> float:
-        """Train the actor network using policy gradient."""
+                    dones: torch.Tensor, is_weights: torch.Tensor) -> Tuple[float, float]:
+        """Train the actor network using policy gradient with importance sampling."""
         # Get action logits and distribution
         logits = self.actor(states)
         dist = torch.distributions.Categorical(logits=logits)
         
-        # Compute advantages (TD error)
+        # Compute advantages (TD error) with normalization
         with torch.no_grad():
             current_values = self.critic(states).squeeze()
             next_values = self.critic(next_states).squeeze()
             targets = rewards + self.gamma * next_values * (~dones)
             advantages = targets - current_values
+            
+            # Normalize advantages for stability
+            if len(advantages) > 1:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             advantages = advantages.detach()
         
-        # Policy gradient loss
+        # Policy gradient loss with importance sampling weights
         log_probs = dist.log_prob(actions)
-        pg_loss = -(log_probs * advantages).mean()
+        pg_loss = -(is_weights * log_probs * advantages).mean()
         entropy = dist.entropy().mean()
-        actor_loss = pg_loss - beta * entropy
+        
+        # Use adaptive entropy coefficient
+        actor_loss = pg_loss - self.current_entropy_coeff * entropy
+        
+        # Update entropy coefficient (decay slowly)
+        self.current_entropy_coeff = max(
+            self.min_entropy_coeff,
+            self.current_entropy_coeff * self.entropy_decay
+        )
         
         # Update actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)  # Reduced clip value
         self.actor_optimizer.step()
+        
+        # Step learning rate scheduler occasionally
+        if self.training_steps % 100 == 0:
+            self.actor_scheduler.step()
         
         loss_value = actor_loss.item()
         self.actor_losses.append(loss_value)
@@ -506,52 +557,34 @@ class GameDataCollector:
         """
         self.trainer = trainer
     
-    def collect_game_data(self, game: Game2048, move_sequence: List[Direction]) -> List[Experience]:
-        """
-        Collect training data from a sequence of moves.
+    def collect_experience(self,
+        current_state,
+        new_state,
+        current_score,
+        new_score,
+        current_max_tile,
+        new_max_tile,
+        success,
+        game_done,
+        move):
         
-        Args:
-            game: Initial game state
-            move_sequence: Sequence of moves made
-            
-        Returns:
-            List[Experience]: Collected experiences
-        """
-        experiences = []
+        # Always calculate reward, including for failed moves
+        reward = self.trainer.compute_shaped_reward(
+            current_state,
+            new_state,
+            current_score,
+            new_score,
+            current_max_tile,
+            new_max_tile,
+            success,
+            game_done
+        )
         
-        # Make a copy of the game to avoid modifying the original
-        game_copy = self._copy_game(game)
+        # Create experience for both successful and failed moves
+        experience = Experience(current_state, move, reward, new_state, game_done)
         
-        for i, move in enumerate(move_sequence):
-            # Record current state
-            current_state = [row[:] for row in game_copy.get_board()]
-            current_score = game_copy.get_score()
-            
-            # Make the move
-            success = game_copy.move(move)
-            
-            if not success:
-                break
-            
-            # Record new state and reward
-            new_state = [row[:] for row in game_copy.get_board()]
-            new_score = game_copy.get_score()
-            reward = new_score - current_score  # Score difference as reward
-            
-            # Check if game is done
-            done = game_copy.get_game_state() != GameState.ONGOING
-            
-            # Create experience
-            experience = Experience(current_state, move, reward, new_state, done)
-            experiences.append(experience)
-            
-            # Add to trainer's buffer
-            self.trainer.collect_experience(experience)
-            
-            if done:
-                break
-        
-        return experiences
+        # Add to trainer's buffer
+        self.trainer.collect_experience(experience)
     
     def _copy_game(self, game: Game2048) -> Game2048:
         """Create a deep copy of the game state."""
@@ -567,7 +600,7 @@ def create_actor_critic_models(hidden_size: int = 512,
                               actor_lr: float = 1e-4, 
                               critic_lr: float = 1e-4) -> Tuple[ActorNetwork, CriticNetwork, ActorCriticTrainer]:
     """
-    Factory function to create Actor-Critic models and trainer.
+    Factory function to create Actor-Critic models and trainer with prioritized experience replay.
     
     Args:
         hidden_size: Size of hidden layers
