@@ -250,6 +250,11 @@ class ActorCriticTrainer:
         self.critic = critic
         self.gamma = gamma
         
+        # Create target critic for stable learning (Polyak averaging)
+        self.target_critic = CriticNetwork(hidden_size=512)
+        self.target_critic.load_state_dict(critic.state_dict())
+        self.tau = 0.005  # Polyak averaging coefficient
+        
         # Optimizers with scheduling
         self.actor_optimizer = optim.Adam(actor.parameters(), lr=actor_lr)
         self.critic_optimizer = optim.Adam(critic.parameters(), lr=critic_lr)
@@ -268,8 +273,8 @@ class ActorCriticTrainer:
         
         # Entropy scheduling for exploration
         self.initial_entropy_coeff = 0.1  # Higher initial value
-        self.min_entropy_coeff = 0.001    # Minimum to maintain some exploration
-        self.entropy_decay = 0.9999       # Very slow decay
+        self.min_entropy_coeff = 0.01     # Higher minimum (10x increase)
+        self.entropy_decay = 0.99995      # Even slower decay
         self.current_entropy_coeff = self.initial_entropy_coeff
         
         # Training statistics
@@ -380,11 +385,14 @@ class ActorCriticTrainer:
         
         # Target values
         with torch.no_grad():
-            next_values = self.critic(next_states).squeeze()
+            # Use target critic for next state values (reduces overestimation)
+            next_values = self.target_critic(next_states).squeeze()
+            # Clip next values first to prevent explosion
+            next_values = torch.clamp(next_values, -50, 50)
             targets = rewards + self.gamma * next_values * (~dones)
             
-            # Clip targets to reasonable range to prevent exploding values
-            targets = torch.clamp(targets, -100, 100)
+            # Clip final targets to reasonable range
+            targets = torch.clamp(targets, -20, 20)  # Much tighter range
         
         # Compute TD errors
         td_errors = targets - current_values
@@ -447,11 +455,19 @@ class ActorCriticTrainer:
         # Step learning rate scheduler occasionally
         if self.training_steps % 100 == 0:
             self.actor_scheduler.step()
+            
+        # Update target critic with Polyak averaging
+        self._update_target_critic()
         
         loss_value = actor_loss.item()
         self.actor_losses.append(loss_value)
         entropy_value = entropy.item()
         return loss_value, entropy_value
+    
+    def _update_target_critic(self):
+        """Update target critic using Polyak averaging."""
+        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
     
     def _direction_to_idx(self, direction: Direction) -> int:
         """Convert Direction to index."""

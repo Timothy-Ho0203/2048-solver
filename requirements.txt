@@ -21,6 +21,11 @@ numpy>=1.21.0
 # For .env file loading:
 python-dotenv>=0.19.0
 
+# For API endpoint (api.py):
+fastapi>=0.115.0
+uvicorn>=0.32.0
+pydantic>=2.0.0
+
 # For development or testing, you might want:
 # pytest>=6.0.0
 # mypy>=0.910 

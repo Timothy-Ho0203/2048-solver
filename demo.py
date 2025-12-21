@@ -757,8 +757,17 @@ def train_actor_critic_agent(num_episodes: int = 100, display_games: bool = Fals
                 
                 # If no improvement for too long, boost exploration
                 if patience_counter >= patience_limit:
-                    trainer.current_entropy_coeff = min(0.05, trainer.current_entropy_coeff * 2.0)
+                    # Reset to a substantial exploration level
+                    trainer.current_entropy_coeff = min(0.08, trainer.current_entropy_coeff * 3.0)
                     print(f"🔄 Performance plateau detected! Boosting exploration to {trainer.current_entropy_coeff:.4f}")
+                    
+                    # Also reduce learning rates to stabilize
+                    for param_group in trainer.actor_optimizer.param_groups:
+                        param_group['lr'] *= 0.8
+                    for param_group in trainer.critic_optimizer.param_groups:
+                        param_group['lr'] *= 0.8
+                    print(f"📉 Reduced learning rates - Actor: {trainer.actor_optimizer.param_groups[0]['lr']:.6f}")
+                    
                     patience_counter = 0
         
         # Print progress
