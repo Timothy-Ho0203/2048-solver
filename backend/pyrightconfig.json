@@ -1,0 +1,10 @@
+{
+  "venvPath": ".",
+  "venv": "venv",
+  "pythonVersion": "3.13",
+  "include": ["."],
+  "exclude": ["**/node_modules", "**/__pycache__", ".git"],
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "pythonPlatform": "Darwin"
+}
