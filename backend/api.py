@@ -235,13 +235,19 @@ async def get_moves_batch(boards: List[BoardState]):
 
 
 if __name__ == "__main__":
+    import os
+
+    # Get host and port from environment variables
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+
     print("Starting 2048 AI Move API server...")
-    print("API documentation available at: http://localhost:8000/docs")
-    print("Health check: http://localhost:8000/health")
+    print(f"API documentation available at: http://localhost:{port}/docs")
+    print(f"Health check: http://localhost:{port}/health")
     print("\nExample curl command:")
-    print('curl -X POST "http://localhost:8000/get_move" \\')
+    print(f'curl -X POST "http://localhost:{port}/get_move" \\')
     print('  -H "Content-Type: application/json" \\')
     print('  -d \'{"board": [[2,0,0,0],[0,0,0,0],[0,0,0,0],[4,0,0,0]]}\'')
     print("\n" + "="*60)
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=host, port=port)
